@@ -19,7 +19,7 @@ sudo chown $(id -u):$(id -g) $(command -v devenv)
 2. **(macOS only)** Ensure the `devenv` binary is authorized to run.
 
 ```bash
-xattr -c $(type -P devenv)
+xattr -c $(command -v devenv)
 ```
 
 3. Follow the instructions for your platform in the [detailed system requirements docs](docs/system-requirements.md)
@@ -43,3 +43,9 @@ export KUBECONFIG="$HOME/.kube/config:$HOME/.outreach/kubeconfig.yaml"
 ```
 
 You now have a developer environment provisioned!
+
+**_Be careful_**: from now on, your dev tools look a lot like production tools. To help with this, when you want to run `kubectl` commands against your dev environment cluster it is recommended you use the built-in wrapper:
+```bash
+$ devenv kubectl <the rest of your kubectl command>
+```
+
