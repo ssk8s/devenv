@@ -19,12 +19,6 @@ import (
 )
 
 func EnsureLoggedIn(ctx context.Context, log logrus.FieldLogger, b *box.Config, k kubernetes.Interface) error {
-	if os.Getenv("CI") == "true" {
-		// Eventually we'll want to allow this for other users
-		log.Info("Skipping Vault authentication in CI")
-		return nil
-	}
-
 	// Check if we need to issue a new token
 	err := exec.CommandContext(ctx, "vault", "token", "lookup").Run()
 	if err != nil {
@@ -44,7 +38,7 @@ func EnsureLoggedIn(ctx context.Context, log logrus.FieldLogger, b *box.Config, 
 	// If we have a Kubernetes client, attempt to add our new credentials into the
 	// environment
 	if k != nil {
-		err2 := refreshKubernetesAuth(ctx, k)
+		err2 := refreshKubernetesAuth(ctx, b, k)
 		if err2 != nil {
 			return err2
 		}
@@ -53,7 +47,7 @@ func EnsureLoggedIn(ctx context.Context, log logrus.FieldLogger, b *box.Config, 
 	return nil
 }
 
-func refreshKubernetesAuth(ctx context.Context, k kubernetes.Interface) error { //nolint:funlen
+func refreshKubernetesAuth(ctx context.Context, b *box.Config, k kubernetes.Interface) error { //nolint:funlen
 	secretName := "vault-secrets-operator"
 	exists := true
 
@@ -83,6 +77,8 @@ func refreshKubernetesAuth(ctx context.Context, k kubernetes.Interface) error { 
 		},
 		Type: corev1.SecretTypeOpaque,
 		StringData: map[string]string{
+			// Override if needed, e.g. vault-dev
+			"VAULT_ADDRESS":              b.DeveloperEnvironmentConfig.VaultConfig.Address,
 			"VAULT_TOKEN":                strings.TrimSpace(string(token)),
 			"VAULT_TOKEN_LEASE_DURATION": "43200",
 		},
