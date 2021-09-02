@@ -19,9 +19,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/getoutreach/devenv/cmd/devenv/destroy"
 	devenvaws "github.com/getoutreach/devenv/pkg/aws"
-	"github.com/getoutreach/devenv/pkg/box"
 	"github.com/getoutreach/devenv/pkg/cmdutil"
 	"github.com/getoutreach/devenv/pkg/snapshoter"
+	"github.com/getoutreach/gobox/pkg/box"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/pkg/errors"
@@ -271,6 +271,20 @@ func (o *Options) generateSnapshot(ctx context.Context, mc *minio.Client, s3c *s
 		err = cmdutil.RunKubernetesCommand(ctx, "", false, "/bin/bash", "-c", t.Command)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to run snapshot supplied command")
+		}
+	}
+
+	if len(t.PostDeployApps) != 0 {
+		o.log.Info("Deploying applications into devenv")
+		for _, app := range t.PostDeployApps {
+			o.log.WithField("application", app).Info("Deploying application")
+			cmd := exec.CommandContext(ctx, os.Args[0], "--skip-update", "deploy-app", app) //nolint:gosec
+			cmd.Stderr = os.Stderr
+			cmd.Stdout = os.Stdout
+			cmd.Stdin = os.Stdin
+			if err := cmd.Run(); err != nil { //nolint:govet // Why: We're OK shadowing err.
+				return nil, errors.Wrap(err, "failed to deploy application")
+			}
 		}
 	}
 
