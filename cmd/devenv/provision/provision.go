@@ -32,6 +32,7 @@ import (
 	"github.com/getoutreach/devenv/pkg/kube"
 	"github.com/getoutreach/devenv/pkg/kubernetesruntime"
 	"github.com/getoutreach/devenv/pkg/snapshoter"
+	"github.com/getoutreach/gobox/pkg/async"
 	"github.com/minio/minio-go/v7"
 
 	"github.com/pkg/errors"
@@ -315,7 +316,7 @@ func (o *Options) snapshotRestore(ctx context.Context) error { //nolint:funlen,g
 		return errors.Wrap(err, "failed to run provision.d scripts")
 	}
 
-	client, rest, err := kube.GetKubeClientWithConfig()
+	client, _, err := kube.GetKubeClientWithConfig()
 	if err != nil {
 		return err
 	}
@@ -329,18 +330,38 @@ func (o *Options) snapshotRestore(ctx context.Context) error { //nolint:funlen,g
 	}
 
 	o.log.Info("Regenerating certificates with local CA")
-	ropts := renew.NewOptions(genericclioptions.IOStreams{In: os.Stdout, Out: os.Stdout, ErrOut: os.Stderr})
-	ropts.AllNamespaces = true
-	ropts.All = true
-	ropts.RESTConfig = rest
-	ropts.CMClient, err = cmclient.NewForConfig(rest)
-	if err != nil {
-		return errors.Wrap(err, "failed to create cert-manager client")
-	}
 
-	// Renew the certificates
-	if err2 := ropts.Run(ctx, []string{}); err2 != nil {
-		return errors.Wrap(err2, "failed to trigger CA certificate regeneration")
+	// CA regeneration can sometimes fail, so retry it on failure
+	for ctx.Err() == nil {
+		// When ropts fails, we need to create a new rest config
+		// so just use a fresh one every time here.
+		_, rest, err2 := kube.GetKubeClientWithConfig()
+		if err2 != nil {
+			return err2
+		}
+
+		ropts := renew.NewOptions(genericclioptions.IOStreams{In: os.Stdout, Out: os.Stdout, ErrOut: os.Stderr})
+		ropts.AllNamespaces = true
+		ropts.All = true
+		ropts.RESTConfig = rest
+		ropts.CMClient, err = cmclient.NewForConfig(rest)
+		if err != nil {
+			return errors.Wrap(err, "failed to create cert-manager client")
+		}
+
+		err2 = ropts.Run(ctx, []string{})
+		if err != nil && strings.Contains(err2.Error(), "the object has been modified") {
+			o.log.WithError(err2).Warn("Retrying certificate regeneration operation ...")
+			async.Sleep(ctx, time.Second*5)
+			continue
+		} else if err2 != nil {
+			return errors.Wrap(err2, "failed to trigger certificate regeneration")
+		}
+
+		break
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	if snapshotTarget.Config.ReadyAddress != "" {
