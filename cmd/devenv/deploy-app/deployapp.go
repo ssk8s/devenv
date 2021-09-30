@@ -7,6 +7,7 @@ import (
 	"github.com/getoutreach/devenv/internal/vault"
 	"github.com/getoutreach/devenv/pkg/app"
 	"github.com/getoutreach/devenv/pkg/cmdutil"
+	"github.com/getoutreach/devenv/pkg/config"
 	"github.com/getoutreach/devenv/pkg/devenvutil"
 	"github.com/getoutreach/devenv/pkg/kube"
 	"github.com/getoutreach/gobox/pkg/box"
@@ -76,10 +77,6 @@ func NewCmdDeployApp(log logrus.FieldLogger) *cli.Command {
 				return err
 			}
 
-			if c.Bool("local") {
-				o.log.Warn("!!! --local is deprecated, please specify just a path instead, e.g. deploy-app .")
-			}
-
 			o.App = c.Args().First()
 			return o.Run(c.Context)
 		},
@@ -92,7 +89,12 @@ func (o *Options) Run(ctx context.Context) error {
 		return errors.Wrap(err, "failed to load box configuration")
 	}
 
-	err = devenvutil.EnsureDevenvRunning(ctx)
+	conf, err := config.LoadConfig(ctx)
+	if err != nil {
+		return errors.Wrap(err, "failed to load config")
+	}
+
+	kr, err := devenvutil.EnsureDevenvRunning(ctx, conf, b)
 	if err != nil {
 		return err
 	}
@@ -103,5 +105,5 @@ func (o *Options) Run(ctx context.Context) error {
 		}
 	}
 
-	return app.Deploy(ctx, o.log, o.k, o.conf, o.App)
+	return app.Deploy(ctx, o.log, o.k, o.conf, o.App, kr.GetConfig())
 }

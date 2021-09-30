@@ -35,7 +35,6 @@ import (
 	"github.com/getoutreach/devenv/cmd/devenv/tunnel"
 	updateapp "github.com/getoutreach/devenv/cmd/devenv/update-app"
 	"github.com/getoutreach/devenv/pkg/cmdutil"
-	"github.com/getoutreach/devenv/pkg/containerruntime"
 	oapp "github.com/getoutreach/gobox/pkg/app"
 	"github.com/getoutreach/gobox/pkg/box"
 	"github.com/getoutreach/gobox/pkg/cfg"
@@ -46,9 +45,11 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
-	"gopkg.in/yaml.v3"
+	"gopkg.in/yaml.v2"
+
 	// Place any extra imports for your startup code here
 	///Block(imports)
+	cmdcontext "github.com/getoutreach/devenv/cmd/devenv/context"
 	///EndBlock(imports)
 )
 
@@ -57,10 +58,6 @@ import (
 var HoneycombTracingKey = "NOTSET" //nolint:gochecknoglobals // Why: We can't compile in things as a const.
 
 ///Block(global)
-var defaultBoxes = []string{
-	"git@github.com:getoutreach/box",
-}
-
 ///EndBlock(global)
 
 // overrideConfigLoaders fakes certain parts of the config that usually get pulled
@@ -105,12 +102,6 @@ func overrideConfigLoaders() {
 }
 
 func main() { //nolint:funlen // Why: We can't dwindle this down anymore without adding complexity.
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Println("stacktrace from panic: \n" + string(debug.Stack()))
-		}
-	}()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	log := logrus.New()
 
@@ -151,13 +142,12 @@ func main() { //nolint:funlen // Why: We can't dwindle this down anymore without
 	}
 	defer exit()
 
-	// wrap everything around a call as this ensures any panics
-	// are caught and recorded properly
 	defer func() {
 		if r := recover(); r != nil {
-			log.Errorf("panic %v", r)
+			fmt.Println("stacktrace from panic: \n" + string(debug.Stack()))
 		}
 	}()
+
 	ctx = trace.StartCall(ctx, "main")
 	defer trace.EndCall(ctx)
 
@@ -208,14 +198,7 @@ func main() { //nolint:funlen // Why: We can't dwindle this down anymore without
 		updateapp.NewCmdUpdateApp(log),
 		snapshot.NewCmdSnapshot(log),
 		expose.NewCmdExpose(log),
-		{
-			// DEPRECATED: Remove on the next minor release, was undocumented
-			Name:   "remove-image",
-			Hidden: true,
-			Action: func(c *cli.Context) error {
-				return containerruntime.RemoveImage(c.Context, c.Args().First())
-			},
-		},
+		cmdcontext.NewCmdContext(log),
 		///EndBlock(commands)
 	}
 
@@ -232,7 +215,7 @@ func main() { //nolint:funlen // Why: We can't dwindle this down anymore without
 			return err
 		}
 
-		_, err = box.EnsureBox(ctx, defaultBoxes, log)
+		_, err = box.EnsureBoxWithOptions(ctx, box.WithLogger(log), box.WithMinVersion(1))
 		if err != nil {
 			return err
 		}

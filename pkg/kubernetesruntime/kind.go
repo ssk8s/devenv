@@ -8,13 +8,18 @@ import (
 	"runtime"
 	"text/template"
 
+	"github.com/getoutreach/devenv/cmd/devenv/status"
 	"github.com/getoutreach/devenv/pkg/cmdutil"
+	"github.com/getoutreach/devenv/pkg/containerruntime"
 	"github.com/getoutreach/devenv/pkg/embed"
 	"github.com/getoutreach/gobox/pkg/app"
+	"github.com/getoutreach/gobox/pkg/box"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
+
+	dockerclient "github.com/docker/docker/client"
 )
 
 const (
@@ -25,16 +30,89 @@ const (
 
 var configTemplate = template.Must(template.New("kind.yaml").Parse(string(embed.MustRead(embed.Config.ReadFile("config/kind.yaml")))))
 
-// EnsureKind ensures that Kind exists and returns
+// Deprecated: This will be removed when there's a new way of doing this.
+// EnsureKind downloads kind
+var EnsureKind = (&KindRuntime{}).ensureKind
+
+type KindRuntime struct {
+	log logrus.FieldLogger
+}
+
+// NewKindRuntime creates a new kind runtime
+func NewKindRuntime() *KindRuntime {
+	return &KindRuntime{}
+}
+
+// ensureKind ensures that Kind exists and returns
 // the location of kind. Note: this outputs text
 // if kind is being downloaded
-func EnsureKind(log logrus.FieldLogger) (string, error) { //nolint:funlen
+func (*KindRuntime) ensureKind(log logrus.FieldLogger) (string, error) { //nolint:funlen
 	return cmdutil.EnsureBinary(log, "kind-"+KindVersion, "Kubernetes Runtime", KindDownloadURL, "")
 }
 
-// InitKind creates a Kubernetes cluster
-func InitKind(ctx context.Context, log logrus.FieldLogger) error {
-	kind, err := EnsureKind(log)
+func (*KindRuntime) PreCreate(ctx context.Context) error {
+	return nil
+}
+
+func (kr *KindRuntime) Configure(log logrus.FieldLogger, _ *box.Config) {
+	kr.log = log
+}
+
+func (*KindRuntime) GetConfig() RuntimeConfig {
+	return RuntimeConfig{
+		Name:        "kind",
+		Type:        RuntimeTypeLocal,
+		ClusterName: "dev-environment",
+	}
+}
+
+// Status gets the status of a runtime
+func (kr *KindRuntime) Status(ctx context.Context) RuntimeStatus {
+	resp := RuntimeStatus{status.Status{
+		Status: status.Unknown,
+	}}
+
+	d, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv)
+	if err != nil {
+		resp.Reason = errors.Wrap(err, "failed to connect to docker").Error()
+		return resp
+	}
+
+	// check the status of the k3s container to determine
+	// if it's stopped
+	cont, err := d.ContainerInspect(ctx, containerruntime.ContainerName)
+	if err != nil {
+		if dockerclient.IsErrNotFound(err) {
+			resp.Status.Status = status.Unprovisioned
+			return resp
+		}
+
+		// we don't know of the error, so... cry
+		resp.Reason = errors.Wrap(err, "failed to inspect container").Error()
+		return resp
+	}
+
+	// read the version of the container
+	if _, ok := cont.Config.Labels["io.outreach.devenv.version"]; ok {
+		resp.Version = cont.Config.Labels["io.outreach.devenv.version"]
+	}
+
+	// parse the container state
+	if cont.State.Status == "exited" {
+		resp.Status.Status = status.Stopped
+		return resp
+	}
+
+	if cont.State.Status == "running" {
+		resp.Status.Status = status.Running
+	}
+
+	return resp
+}
+
+// Create creates a new Kind cluster
+func (kr *KindRuntime) Create(ctx context.Context) error {
+	kind, err := kr.ensureKind(kr.log)
 	if err != nil {
 		return err
 	}
@@ -65,6 +143,7 @@ func InitKind(ctx context.Context, log logrus.FieldLogger) error {
 		return errors.Wrap(err, "failed to generate kind configuration")
 	}
 
+	// we use a temp file for the kubeconfig because we don't actually use it
 	cmd := exec.CommandContext(ctx, kind, "create", "cluster", "--name", KindClusterName, "--wait", "5m", "--config", renderedConfig.Name(),
 		"--kubeconfig", filepath.Join(os.TempDir(), "devenv-kubeconfig-tmp.yaml"))
 	cmd.Stdout = os.Stdout
@@ -73,9 +152,9 @@ func InitKind(ctx context.Context, log logrus.FieldLogger) error {
 	return errors.Wrap(cmd.Run(), "failed to run kind")
 }
 
-// ResetKind nukes an existing Kubernetes cluster
-func ResetKind(ctx context.Context, log logrus.FieldLogger) error {
-	kind, err := EnsureKind(log)
+// Destroy destroys a kind cluster
+func (kr *KindRuntime) Destroy(ctx context.Context) error {
+	kind, err := kr.ensureKind(kr.log)
 	if err != nil {
 		return err
 	}
@@ -88,8 +167,8 @@ func ResetKind(ctx context.Context, log logrus.FieldLogger) error {
 // This is based on the original shell hack, but a lot safer:
 // "$kindPath" get kubeconfig --name "$(yq -r ".name" <"$LIBDIR/kind.yaml")"
 //   | sed 's/kind-dev-environment/dev-environment/' >"$KUBECONFIG"
-func GetKubeConfig(ctx context.Context, log logrus.FieldLogger) (*api.Config, error) {
-	kind, err := EnsureKind(log)
+func (kr *KindRuntime) GetKubeConfig(ctx context.Context) (*api.Config, error) {
+	kind, err := kr.ensureKind(logrus.New())
 	if err != nil {
 		return nil, err
 	}
@@ -112,4 +191,26 @@ func GetKubeConfig(ctx context.Context, log logrus.FieldLogger) (*api.Config, er
 	kubeconfig.CurrentContext = KindClusterName
 
 	return kubeconfig, nil
+}
+
+func (kr *KindRuntime) GetClusters(ctx context.Context) ([]*RuntimeCluster, error) {
+	curStatus := kr.Status(ctx).Status.Status
+
+	if curStatus == status.Unprovisioned || curStatus == status.Unknown {
+		// Only return a cluster if it's actively running
+		return []*RuntimeCluster{}, nil
+	}
+
+	kubeconfig, err := kr.GetKubeConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return []*RuntimeCluster{
+		{
+			Name:        KindClusterName,
+			RuntimeName: kr.GetConfig().Name,
+			KubeConfig:  kubeconfig,
+		},
+	}, nil
 }

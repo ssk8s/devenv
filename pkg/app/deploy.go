@@ -25,8 +25,8 @@ import (
 )
 
 // Deploy deploys an application by name, to the devenv.
-func Deploy(ctx context.Context, log logrus.FieldLogger, k kubernetes.Interface, conf *rest.Config, appNameOrPath string) error {
-	app, err := NewApp(log, k, conf, appNameOrPath)
+func Deploy(ctx context.Context, log logrus.FieldLogger, k kubernetes.Interface, conf *rest.Config, appNameOrPath string, kr kubernetesruntime.RuntimeConfig) error {
+	app, err := NewApp(log, k, conf, appNameOrPath, &kr)
 	if err != nil {
 		return errors.Wrap(err, "parse app")
 	}
@@ -51,10 +51,14 @@ func (a *App) deployBootstrap(ctx context.Context) error { //nolint:funlen
 	// or if we're in local mode
 	builtDockerImage := false
 	if a.Version != "" || a.Local {
-		if err := a.buildDockerImage(ctx); err != nil {
-			return errors.Wrap(err, "failed to build image")
+		if a.kr.Type == kubernetesruntime.RuntimeTypeLocal {
+			if err := a.buildDockerImage(ctx); err != nil {
+				return errors.Wrap(err, "failed to build image")
+			}
+			builtDockerImage = true
+		} else {
+			a.log.Warn("Skipping docker image build, not supported with remote clusters")
 		}
-		builtDockerImage = true
 	}
 
 	a.log.Info("Deploying application into devenv...")
@@ -139,6 +143,7 @@ func (a *App) buildDockerImage(ctx context.Context) error {
 	}
 
 	a.log.Info("Pushing built Docker Image into Kubernetes")
+	//nolint:staticcheck // Why: we're aware of the deprecation
 	kindPath, err := kubernetesruntime.EnsureKind(a.log)
 	if err != nil {
 		return errors.Wrap(err, "failed to find/download Kind")

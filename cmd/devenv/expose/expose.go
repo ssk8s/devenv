@@ -10,8 +10,10 @@ import (
 	"strings"
 
 	"github.com/getoutreach/devenv/pkg/cmdutil"
+	"github.com/getoutreach/devenv/pkg/config"
 	"github.com/getoutreach/devenv/pkg/devenvutil"
 	"github.com/getoutreach/devenv/pkg/kube"
+	"github.com/getoutreach/gobox/pkg/box"
 	"github.com/manifoldco/promptui"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -126,16 +128,16 @@ func (o *Options) EnsureAuthenticated(ctx context.Context) (*NgrokConfig, error)
 
 	configPath := filepath.Join(homeDir, ".ngrok2", "ngrok.yml")
 
-	var config *NgrokConfig
+	var conf *NgrokConfig
 
 	f, err := os.Open(configPath)
 	if err == nil {
 		// Validate the auth token at some point, for now we ensure it's not null
-		err = yaml.NewDecoder(f).Decode(&config)
+		err = yaml.NewDecoder(f).Decode(&conf)
 		f.Close()
 		if err == nil {
-			if config.AuthToken != "" {
-				return config, nil
+			if conf.AuthToken != "" {
+				return conf, nil
 			}
 		}
 	}
@@ -155,16 +157,16 @@ func (o *Options) EnsureAuthenticated(ctx context.Context) (*NgrokConfig, error)
 		return nil, errors.Wrap(err, "provided input was empty")
 	}
 
-	config = &NgrokConfig{
+	conf = &NgrokConfig{
 		AuthToken: resp,
 	}
 
-	b, err := yaml.Marshal(config)
+	b, err := yaml.Marshal(conf)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to marshal ngrok configuration")
 	}
 
-	return config, ioutil.WriteFile(configPath, b, 0600)
+	return conf, ioutil.WriteFile(configPath, b, 0600)
 }
 
 func (o *Options) CreateNgrokInstance(ctx context.Context, conf *NgrokConfig) error { //nolint:funlen
@@ -257,11 +259,22 @@ func (o *Options) CreateNgrokInstance(ctx context.Context, conf *NgrokConfig) er
 }
 
 func (o *Options) Run(ctx context.Context) error {
-	if err := devenvutil.EnsureDevenvRunning(ctx); err != nil {
+	b, err := box.LoadBox()
+	if err != nil {
 		return err
 	}
 
-	conf, err := o.EnsureAuthenticated(ctx)
+	conf, err := config.LoadConfig(ctx)
+	if err != nil {
+		return errors.Wrap(err, "failed to load config")
+	}
+
+	//nolint:govet // Why: err shadow
+	if _, err := devenvutil.EnsureDevenvRunning(ctx, conf, b); err != nil {
+		return err
+	}
+
+	exconf, err := o.EnsureAuthenticated(ctx)
 	if err != nil {
 		return err
 	}
@@ -271,5 +284,5 @@ func (o *Options) Run(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to find service '%s', cannot create ngrok pod", fmt.Sprintf("%s/%s", o.ServiceNamespace, o.ServiceName))
 	}
 
-	return o.CreateNgrokInstance(ctx, conf)
+	return o.CreateNgrokInstance(ctx, exconf)
 }

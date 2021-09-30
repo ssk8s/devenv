@@ -4,16 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	dockerclient "github.com/docker/docker/client"
 	"github.com/getoutreach/devenv/pkg/cmdutil"
-	"github.com/getoutreach/devenv/pkg/devenvutil"
 	"github.com/getoutreach/devenv/pkg/kube"
-	"github.com/getoutreach/devenv/pkg/snapshoter"
 	"github.com/getoutreach/devenv/pkg/worker"
 	"github.com/getoutreach/gobox/pkg/box"
 	"github.com/pkg/errors"
@@ -22,10 +18,10 @@ import (
 	"gopkg.in/yaml.v2"
 
 	corev1 "k8s.io/api/core/v1"
-	apixv1client "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -56,11 +52,11 @@ var (
 )
 
 type Options struct {
-	log  logrus.FieldLogger
-	k    kubernetes.Interface
-	d    dockerclient.APIClient
-	vc   veleroclient.Interface
-	apix apixv1client.Interface
+	log logrus.FieldLogger
+	k   kubernetes.Interface
+	r   *rest.Config
+	d   dockerclient.APIClient
+	vc  veleroclient.Interface
 }
 
 func NewOptions(log logrus.FieldLogger) (*Options, error) {
@@ -83,15 +79,11 @@ func NewOptions(log logrus.FieldLogger) (*Options, error) {
 	if k != nil {
 		var err error
 		opts.k = k
+		opts.r = conf
 
 		opts.vc, err = veleroclient.NewForConfig(conf)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to create snapshot client")
-		}
-
-		opts.apix, err = apixv1client.NewForConfig(conf)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to create apix client")
 		}
 	}
 
@@ -107,58 +99,9 @@ func NewCmdSnapshot(log logrus.FieldLogger) *cli.Command { //nolint:funlen
 		Before: func(c *cli.Context) error {
 			var err error
 			o, err = NewOptions(log)
-			if err != nil {
-				return err
-			}
-
-			ctx := c.Context
-			return snapshoter.Ensure(ctx, o.d, o.log)
+			return err
 		},
 		Subcommands: []*cli.Command{
-			{
-				Name:        "create",
-				Description: "Create a new snapshot of your developer environment. Deprecated: Use generate instead.",
-				Hidden:      true,
-				Usage:       "devenv snapshot create",
-				Action: func(c *cli.Context) error {
-					if err := devenvutil.EnsureDevenvRunning(c.Context); err != nil {
-						return err
-					}
-					_, err := o.CreateSnapshot(c.Context)
-					return err
-				},
-			},
-			{
-				Name:        "restore",
-				Description: "Restore an existing snapshot of your developer environment",
-				Usage:       "devenv snapshot restore <name>",
-				Action: func(c *cli.Context) error {
-					if err := devenvutil.EnsureDevenvRunning(c.Context); err != nil {
-						log.Info("If you're looking to provision an environment with a snapshot, try 'devenv provision --snapshot <name>'")
-						return err
-					}
-					return o.RestoreSnapshot(c.Context, c.Args().First(), true)
-				},
-			},
-			{
-				Name:        "delete",
-				Description: "Delete an existing snapshot of your developer environment",
-				Usage:       "devenv snapshot delete",
-				Action: func(c *cli.Context) error {
-					if err := devenvutil.EnsureDevenvRunning(c.Context); err != nil {
-						return err
-					}
-					return o.DeleteSnapshot(c.Context, c.Args().First())
-				},
-			},
-			{
-				Name:        "list",
-				Description: "List all existing snapshots of your developer environment",
-				Usage:       "devenv snapshot list",
-				Action: func(c *cli.Context) error {
-					return o.ListSnapshots(c.Context)
-				},
-			},
 			{
 				Name:        "generate",
 				Description: "Generate a snapshot from a snapshot definition",
@@ -191,23 +134,6 @@ func NewCmdSnapshot(log logrus.FieldLogger) *cli.Command { //nolint:funlen
 			},
 		},
 	}
-}
-
-func (o *Options) ListSnapshots(ctx context.Context) error {
-	snapshots, err := snapshoter.ListSnapshots(ctx)
-	if err != nil {
-		return err
-	}
-
-	w := tabwriter.NewWriter(os.Stdout, 10, 0, 5, ' ', 0)
-	defer w.Flush()
-
-	fmt.Fprintln(w, "NAME\tSTATUS")
-	for _, b := range snapshots { //nolint:gocritic
-		fmt.Fprintf(w, "%s\t%s\n", b.Name, b.Status.Phase)
-	}
-
-	return w.Flush()
 }
 
 func (o *Options) DeleteSnapshot(ctx context.Context, snapshotName string) error {
@@ -385,6 +311,20 @@ func (o *Options) RestoreSnapshot(ctx context.Context, snapshotName string, live
 			RestorePVs:              boolptr.True(),
 			IncludeClusterResources: boolptr.True(),
 			PreserveNodePorts:       boolptr.True(),
+
+			// TODO(DTSS-829): This should be moved into the generation framework
+			ExcludedNamespaces: []string{
+				"nginx-ingress",
+				"kube-system",
+				"cert-manager",
+				"nginx-ingress",
+				"velero",
+				"minio",
+				"vault-secrets-operator",
+				"local-path-storage",
+				"monitoring",
+				"resourcer--bento1a",
+			},
 		},
 	}, metav1.CreateOptions{}); err != nil {
 		return err
@@ -454,7 +394,7 @@ func (o *Options) CreateBackupStorage(ctx context.Context, name, bucket string) 
 			Config: map[string]string{
 				"region":           "minio",
 				"s3ForcePathStyle": "true",
-				"s3Url":            fmt.Sprintf("http://%s:9000", snapshoter.MinioContainerName),
+				"s3Url":            "http://minio.minio:9000",
 			},
 		},
 	}, metav1.CreateOptions{})

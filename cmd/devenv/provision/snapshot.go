@@ -1,54 +1,34 @@
 package provision
 
 import (
-	"archive/tar"
-	"bytes"
 	"context"
-	"crypto/md5" //nolint:gosec // Why: We're just doing digest checking
-	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/cenkalti/backoff/v4"
-	"github.com/getoutreach/devenv/pkg/snapshoter"
+	"github.com/getoutreach/devenv/pkg/snapshot"
+	"github.com/getoutreach/gobox/pkg/app"
+	"github.com/getoutreach/gobox/pkg/async"
 	"github.com/getoutreach/gobox/pkg/box"
-	"github.com/minio/minio-go/v7"
 	"github.com/pkg/errors"
-	"github.com/schollz/progressbar/v3"
 	"gopkg.in/yaml.v2"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-type localSnapshot struct {
-	Name     string                    `yaml:"name"`
-	Metadata *box.SnapshotLockListItem `yaml:"metadata"`
-}
-
-// fetchSnapshot finds the latest snapshot by name
-// downloads it, stages it into the restore bucket, then returns the config.
-// It's stored in it's own local S3 bucket because restic isn't namespaced
-// which is used to store volume contents.
-func (o *Options) fetchSnapshot(ctx context.Context) (*box.SnapshotLockListItem, error) { //nolint:funlen
-	bucketName := fmt.Sprintf("%s-restore", snapshoter.MinioSnapshotBucketName)
-	err := snapshoter.Ensure(ctx, o.d, o.log)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to ensure snapshot local-storage was running")
-	}
-
+// fetchSnapshot fetches the latest snapshot information from the box configured
+// snapshot bucket based on the provided snapshot channel and target. Then a kubernetes
+// job is kicked off that runs snapshot-uploader to actually stage the snapshot
+// for velero to restore later.
+func (o *Options) fetchSnapshot(ctx context.Context) (*box.SnapshotLockListItem, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(o.b.DeveloperEnvironmentConfig.SnapshotConfig.Region))
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to load SDK config")
-	}
-
-	m, err := snapshoter.CreateMinioClient()
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create local snapshot storage client")
 	}
 
 	s3client := s3.NewFromConfig(cfg)
@@ -80,156 +60,114 @@ func (o *Options) fetchSnapshot(ctx context.Context) (*box.SnapshotLockListItem,
 	}
 
 	latestSnapshotFile := lockfile.TargetsV2[o.SnapshotTarget].Snapshots[o.SnapshotChannel][0]
-
-	if currentResp, err2 := m.GetObject(ctx, bucketName, "current.yaml", minio.GetObjectOptions{}); err2 == nil {
-		var current *localSnapshot
-		err2 = yaml.NewDecoder(currentResp).Decode(&current)
-		if err2 == nil {
-			if current.Name == o.SnapshotTarget && current.Metadata.Digest == latestSnapshotFile.Digest {
-				o.log.Info("Using already downloaded snapshot")
-				return current.Metadata, nil
-			}
-		}
-	}
-
-	// If we're at this point, ensure that the bucket we want is empty
-	o.log.Info("preparing local storage for snapshot")
-	for obj := range m.ListObjects(ctx, bucketName, minio.ListObjectsOptions{Recursive: true}) {
-		if obj.Key == "" {
-			continue
-		}
-
-		o.log.WithField("key", obj.Key).Debug("removing old snapshot file")
-		err2 := m.RemoveObject(ctx, bucketName, obj.Key, minio.RemoveObjectOptions{})
-		if err2 != nil {
-			o.log.WithError(err2).WithField("key", obj.Key).Warn("failed to remove old snapshot key")
-		}
-	}
-
-	return latestSnapshotFile, o.uploadFilesFromArchive(ctx, m, bucketName, latestSnapshotFile, s3client)
+	return latestSnapshotFile, o.stageSnapshot(ctx, latestSnapshotFile, &cfg)
 }
 
-func (o *Options) downloadArchive(ctx context.Context, snapshot *box.SnapshotLockListItem, s3client *s3.Client) (*os.File, error) { //nolint:funlen
-	obj, err := s3client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &o.b.DeveloperEnvironmentConfig.SnapshotConfig.Bucket,
-		Key:    &snapshot.URI,
-	})
+// startSnapshotRestore kicks off the snapshot staging job and waits for
+// it to finish
+//nolint:funlen // Why: most of this is just structs
+func (o *Options) stageSnapshot(ctx context.Context, s *box.SnapshotLockListItem, cfg *aws.Config) error {
+	creds, err := cfg.Credentials.Retrieve(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to fetch the latest snapshot information")
+		return errors.Wrap(err, "failed to retrieve aws credentials")
 	}
-	defer obj.Body.Close()
 
-	bar := progressbar.DefaultBytes(
-		obj.ContentLength,
-		"downloading snapshot",
-	)
+	conf := &snapshot.Config{
+		Dest: snapshot.S3Config{
+			S3Host:       "minio.minio:9000",
+			Bucket:       "velero-restore",
+			Key:          "/",
+			AWSAccessKey: "minioaccess",
+			AWSSecretKey: "miniosecret",
+		},
+		Source: snapshot.S3Config{
+			// IDEA: probably should put this in our box configuration?
+			S3Host:          "s3.amazonaws.com",
+			Bucket:          o.b.DeveloperEnvironmentConfig.SnapshotConfig.Bucket,
+			Key:             s.URI,
+			AWSAccessKey:    creds.AccessKeyID,
+			AWSSecretKey:    creds.SecretAccessKey,
+			AWSSessionToken: creds.SessionToken,
+			Digest:          s.Digest,
+			Region:          o.b.DeveloperEnvironmentConfig.SnapshotConfig.Region,
+		},
+	}
 
-	tmpFile, err := os.CreateTemp("", "devenv-snapshot-*")
+	// marshal the configuration into json so that
+	// it can be consumed by the snapshot uploader
+	confStr, err := json.Marshal(conf)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create temporary file")
+		return errors.Wrap(err, "failed to marshal snapshot configuration")
 	}
 
-	tmpFile.Close()           //nolint:errcheck // Why: Best effort
-	os.Remove(tmpFile.Name()) //nolint:errcheck // Why: Best effort
-
-	err = os.MkdirAll(filepath.Dir(tmpFile.Name()), 0755)
+	// IDEA: spinner of some sort here?
+	o.log.Info("Waiting for snapshot to finish downloading")
+	jo, err := o.k.BatchV1().Jobs("devenv").Create(ctx, &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "snapshot-stage-",
+		},
+		Spec: batchv1.JobSpec{
+			Completions:  aws.Int32(1),
+			BackoffLimit: aws.Int32(3),
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					Containers: []corev1.Container{
+						{
+							Name:    "snapshot-stage",
+							Image:   "gcr.io/outreach-docker/devenv:" + app.Info().Version,
+							Command: []string{"/usr/local/bin/snapshot-uploader"},
+							Env: []corev1.EnvVar{
+								{
+									Name:  "CONFIG",
+									Value: string(confStr),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create temporary directory")
+		return errors.Wrap(err, "failed to create snapshot staging job")
 	}
 
-	f, err := os.Create(tmpFile.Name())
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create temporary file")
-	}
-
-	digest := md5.New() //nolint:gosec // Why: we're just checking the digest
-
-	_, err = io.Copy(io.MultiWriter(bar, f, digest), obj.Body)
-	f.Close()
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to write file")
-	}
-
-	gotMD5 := base64.StdEncoding.EncodeToString(digest.Sum(nil))
-	if gotMD5 != snapshot.Digest {
-		return nil, fmt.Errorf("downloaded snapshot failed checksum validation")
-	}
-
-	f, err = os.Open(tmpFile.Name())
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to open temporary file")
-	}
-
-	return f, err
+	return o.waitForJobToComplete(ctx, jo)
 }
 
-// uploadFilesFromArchive uploads the files from a given tar.xz archive
-// into our local S3 bucket
-func (o *Options) uploadFilesFromArchive(ctx context.Context, m *minio.Client, bucketName string, snapshot *box.SnapshotLockListItem, s3client *s3.Client) error { //nolint:funlen
-	t := backoff.WithMaxRetries(backoff.WithContext(backoff.NewExponentialBackOff(), ctx), 5)
-
-	var f *os.File
-	for {
-		var err error
-		f, err = o.downloadArchive(ctx, snapshot, s3client)
+func (o *Options) waitForJobToComplete(ctx context.Context, jo *batchv1.Job) error {
+	for ctx.Err() == nil {
+		jo2, err := o.k.BatchV1().Jobs(jo.Namespace).Get(ctx, jo.Name, metav1.GetOptions{})
 		if err == nil {
-			break
-		}
+			// check if the job finished, if so return
+			if jo2.Status.CompletionTime != nil && !jo2.Status.CompletionTime.Time.IsZero() {
+				return nil
+			}
 
-		waitTime := t.NextBackOff()
-		if waitTime == backoff.Stop { // this is hit when max attempts or context is canceled
-			return fmt.Errorf("reached maximum attempts")
-		}
-		o.log.WithError(err).Warnf("failed to download archive, waiting to try again: %s", waitTime)
+			for i := range jo2.Status.Conditions {
+				cond := &jo2.Status.Conditions[i]
 
-		time.Sleep(waitTime)
-	}
+				// Exit if we find a complete job condition. In theory we should've hit this
+				// above, but it's a special catch all.
+				if cond.Type == batchv1.JobComplete && cond.Status == corev1.ConditionTrue {
+					return nil
+				}
 
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
+				// If we're not failed, or we're false if failed, then skip this condition
+				if cond.Type != batchv1.JobFailed || cond.Status != corev1.ConditionTrue {
+					continue
+				}
 
-	bar := progressbar.DefaultBytes(
-		info.Size(),
-		"extracting snapshot",
-	)
-
-	tarReader := tar.NewReader(io.TeeReader(f, bar))
-
-	for {
-		header, err := tarReader.Next() //nolint:govet // Why: OK shadowing err
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			return errors.Wrap(err, "failed to read tar header")
-		}
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			continue
-		case tar.TypeReg:
-			fileName := strings.TrimPrefix(header.Name, "./")
-			o.log.WithField("fileName", fileName).Debug("extracting and uploading to local bucket file")
-			_, err := m.PutObject(ctx, bucketName,
-				fileName, tarReader, header.Size, minio.PutObjectOptions{
-					SendContentMd5: true,
-				})
-			if err != nil {
-				return errors.Wrapf(err, "failed to upload file '%s'", fileName)
+				// We check here if we're BackOffLimitExceeded so we can bail out entirely.
+				// This works as backoff logic
+				if strings.Contains(cond.Reason, "BackoffLimitExceeded") {
+					return fmt.Errorf("Snapshot restore entered BackoffLimitExceeded, giving up")
+				}
 			}
 		}
-	}
 
-	currentYaml, err := yaml.Marshal(localSnapshot{
-		Name:     o.SnapshotTarget,
-		Metadata: snapshot,
-	})
-	if err != nil {
-		return err
+		async.Sleep(ctx, time.Second*10)
 	}
-	currentSnapshot := bytes.NewReader(currentYaml)
-
-	_, err = m.PutObject(ctx, bucketName, "current.yaml", currentSnapshot, currentSnapshot.Size(), minio.PutObjectOptions{})
-	return errors.Wrap(err, "failed to set current snapshot")
+	return ctx.Err()
 }

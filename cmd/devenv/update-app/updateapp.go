@@ -7,6 +7,7 @@ import (
 
 	deployapp "github.com/getoutreach/devenv/cmd/devenv/deploy-app"
 	"github.com/getoutreach/devenv/pkg/cmdutil"
+	"github.com/getoutreach/devenv/pkg/config"
 	"github.com/getoutreach/devenv/pkg/containerruntime"
 	"github.com/getoutreach/devenv/pkg/devenvutil"
 	"github.com/getoutreach/devenv/pkg/kube"
@@ -314,7 +315,18 @@ func (o *Options) updateServices(ctx context.Context, services []*service) error
 }
 
 func (o *Options) Run(ctx context.Context) error {
-	if err := devenvutil.EnsureDevenvRunning(ctx); err != nil {
+	b, err := box.LoadBox()
+	if err != nil {
+		return err
+	}
+
+	conf, err := config.LoadConfig(ctx)
+	if err != nil {
+		return errors.Wrap(err, "failed to load config")
+	}
+
+	//nolint:govet // Why: err shadow
+	if _, err := devenvutil.EnsureDevenvRunning(ctx, conf, b); err != nil {
 		return err
 	}
 
