@@ -19,7 +19,22 @@ import (
 	"strings"
 	"syscall"
 
+	oapp "github.com/getoutreach/gobox/pkg/app"
+	"github.com/getoutreach/gobox/pkg/box"
+	"github.com/getoutreach/gobox/pkg/cfg"
+	olog "github.com/getoutreach/gobox/pkg/log"
+	"github.com/getoutreach/gobox/pkg/secrets"
+	"github.com/getoutreach/gobox/pkg/trace"
+	"github.com/getoutreach/gobox/pkg/updater"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"github.com/urfave/cli/v2"
+	"gopkg.in/yaml.v3"
+
+	// Place any extra imports for your startup code here
+	///Block(imports)
 	"github.com/getoutreach/devenv/cmd/devenv/completion"
+	cmdcontext "github.com/getoutreach/devenv/cmd/devenv/context"
 	deleteapp "github.com/getoutreach/devenv/cmd/devenv/delete-app"
 	deployapp "github.com/getoutreach/devenv/cmd/devenv/deploy-app"
 	"github.com/getoutreach/devenv/cmd/devenv/destroy"
@@ -35,21 +50,6 @@ import (
 	"github.com/getoutreach/devenv/cmd/devenv/tunnel"
 	updateapp "github.com/getoutreach/devenv/cmd/devenv/update-app"
 	"github.com/getoutreach/devenv/pkg/cmdutil"
-	oapp "github.com/getoutreach/gobox/pkg/app"
-	"github.com/getoutreach/gobox/pkg/box"
-	"github.com/getoutreach/gobox/pkg/cfg"
-	olog "github.com/getoutreach/gobox/pkg/log"
-	"github.com/getoutreach/gobox/pkg/secrets"
-	"github.com/getoutreach/gobox/pkg/trace"
-	"github.com/getoutreach/gobox/pkg/updater"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli/v2"
-	"gopkg.in/yaml.v2"
-
-	// Place any extra imports for your startup code here
-	///Block(imports)
-	cmdcontext "github.com/getoutreach/devenv/cmd/devenv/context"
 	///EndBlock(imports)
 )
 
@@ -142,10 +142,14 @@ func main() { //nolint:funlen // Why: We can't dwindle this down anymore without
 	}
 	defer exit()
 
+	// Print a stack trace when a panic occurs and set the exit code
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Println("stacktrace from panic: \n" + string(debug.Stack()))
 		}
+
+		// Go sets panic exit codes to 2
+		exitCode = 2
 	}()
 
 	ctx = trace.StartCall(ctx, "main")
@@ -256,8 +260,8 @@ func main() { //nolint:funlen // Why: We can't dwindle this down anymore without
 			case "linux", "darwin":
 				cleanup = func() {
 					log.Infof("devenv has been updated")
-					osarg0 := os.Args[0]
-					err := syscall.Exec(osarg0, os.Args, os.Environ())
+					//nolint:gosec // Why: We're passing in os.Args
+					err := syscall.Exec(os.Args[0], os.Args[1:], os.Environ())
 					if err != nil {
 						log.WithError(err).Error("failed to execute updated binary")
 					}
